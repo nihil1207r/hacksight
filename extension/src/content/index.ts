@@ -88,7 +88,9 @@ function withReplay(action: () => void): void {
 function replayFiles(files: File[], context: UploadContext): boolean {
   const transfer = new DataTransfer();
   files.forEach((file) => transfer.items.add(file));
-  if (context.input) {
+
+  const replayViaInput = (): boolean => {
+    if (!context.input) return false;
     try {
       withReplay(() => {
         context.input!.files = transfer.files;
@@ -97,9 +99,21 @@ function replayFiles(files: File[], context: UploadContext): boolean {
       });
       return true;
     } catch {
-      // Try the drop replay below for sites without a mutable input.
+      return false;
     }
+  };
+
+  // Prefer replaying the *same kind* of event the file actually arrived
+  // as — that's what genuinely mirrors what the page's own upload logic is
+  // wired to. Falling back to "any nearby file input" first (as this used
+  // to do) can silently misfire on pages with more than one file input for
+  // unrelated features (avatar upload, a different attach button, etc.):
+  // the replay reports success, but nothing the person can see actually
+  // happens, because that input has no listener tied to this upload flow.
+  if (context.source === "input") {
+    if (replayViaInput()) return true;
   }
+
   if (context.source === "drop" && context.target instanceof EventTarget) {
     const destination = context.target instanceof Element ? context.target : document.body;
     withReplay(() => destination.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer })));
@@ -110,7 +124,9 @@ function replayFiles(files: File[], context: UploadContext): boolean {
     withReplay(() => destination.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer })));
     return true;
   }
-  return false;
+
+  // Last resort, for the rare case none of the above applied.
+  return replayViaInput();
 }
 
 async function reviewFiles(files: File[], context: UploadContext, settings: Settings, site: SiteId): Promise<void> {
@@ -275,6 +291,12 @@ function notifyDragEnded(originalTarget: EventTarget | null): void {
   if (originalTarget) targets.add(originalTarget);
   for (const target of targets) {
     target.dispatchEvent(new DragEvent("dragleave", { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() }));
+    // Some drop zones only clear their "dragging" UI state inside their own
+    // onDrop handler (rather than on dragleave), and never see the real
+    // drop we intercepted. A drop with zero files is safe to replay — the
+    // page's handler runs and resets its own state, but there is nothing
+    // in it for the page's upload logic to actually act on.
+    target.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: new DataTransfer() }));
   }
 }
 
