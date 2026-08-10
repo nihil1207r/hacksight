@@ -1,0 +1,172 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+@import "tailwindcss";
+
+:root {
+  --void: #09090d;
+  --surface: rgba(20, 22, 28, 0.55);
+  --surface-solid: #14161c;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.14);
+  --text: #edeef2;
+  --muted: #8a8f9c;
+  --muted-dim: #5c606b;
+  --red: #ff3b4e;
+  --red-dim: rgba(255, 59, 78, 0.12);
+  --red-border: rgba(255, 59, 78, 0.35);
+  --green: #33d992;
+  --green-dim: rgba(51, 217, 146, 0.1);
+  --green-border: rgba(51, 217, 146, 0.35);
+  --amber: #ffb020;
+  --amber-dim: rgba(255, 176, 32, 0.1);
+  --amber-border: rgba(255, 176, 32, 0.35);
+  --orange: #ff7a1a;
+  --orange-dim: rgba(255, 122, 26, 0.1);
+  --orange-border: rgba(255, 122, 26, 0.35);
+}
+
+html,
+body {
+  background: radial-gradient(circle at 50% 0%, #16141a 0%, var(--void) 55%);
+  color: var(--text);
+  font-family: "Inter", sans-serif;
+  min-height: 100vh;
+}
+
+.font-display {
+  font-family: "Space Grotesk", sans-serif;
+}
+
+.font-mono {
+  font-family: "JetBrains Mono", monospace;
+}
+
+.glass {
+  background: var(--surface);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+}
+
+@keyframes scanline {
+  0% {
+    top: 0%;
+  }
+  50% {
+    top: 98%;
+  }
+  100% {
+    top: 0%;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin-slow {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.skeleton-bar {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.05),
+    rgba(255, 255, 255, 0.12),
+    rgba(255, 255, 255, 0.05)
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes boxPulse {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.finding-box {
+  animation: boxPulse 1.8s ease-in-out infinite;
+}
+
+/* Landing-page entrance animations — deliberately plain CSS, not Framer
+ * Motion, so the landing bundle (the one every visitor pays for) doesn't
+ * pull in an animation library that's only really needed once you're in
+ * the analysis screen. */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s ease-out both;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.4s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-spin-slow,
+  .skeleton-bar,
+  .finding-box,
+  .animate-fade-in-up,
+  .animate-scale-in {
+    animation: none !important;
+  }
+}
+
+/* Final UX polish: keyboard focus + hover feedback on interactive elements */
+:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+button {
+  transition: filter 120ms ease, background 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+
+button:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+a {
+  transition: opacity 120ms ease;
+}

@@ -1,0 +1,42 @@
+name: Scan PR images for leaked secrets
+
+# Catches the same thing HackSight catches in the browser — a screenshot
+# with an API key or .env file visible — before it lands in the repo (e.g.
+# a bug-report or docs screenshot attached to a PR).
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  scan-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed image files
+        id: images
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FILES=$(git diff --name-only --diff-filter=d "$BASE" "$HEAD" -- '*.png' '*.jpg' '*.jpeg' '*.webp')
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        if: steps.images.outputs.files != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+
+      - name: Install dependencies
+        if: steps.images.outputs.files != ''
+        run: npm ci
+
+      - name: Scan changed images
+        if: steps.images.outputs.files != ''
+        env:
+          FILES: ${{ steps.images.outputs.files }}
+        run: npm run scan:images -- $FILES

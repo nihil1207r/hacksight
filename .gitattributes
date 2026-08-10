@@ -1,0 +1,13 @@
+# The browser extension bundles an offline NER model and WASM runtimes so
+# scanning never has to leave the device. Several of these files are large
+# (the NER model is ~104MB on its own), and one exceeds GitHub's 100MB
+# per-file limit for regular git — track them with Git LFS instead.
+#
+# Before your first commit of these files:
+#   git lfs install
+#   git add .gitattributes
+# Git LFS then handles the files listed below automatically on `git add`.
+
+extension/public/models/**/*.onnx filter=lfs diff=lfs merge=lfs -text
+extension/public/wasm/*.wasm filter=lfs diff=lfs merge=lfs -text
+extension/public/tesseract-core/*.wasm filter=lfs diff=lfs merge=lfs -text
