@@ -114,15 +114,49 @@ function replayFiles(files: File[], context: UploadContext): boolean {
     if (replayViaInput()) return true;
   }
 
+  // Reviewing findings and (especially) generating a redacted copy takes
+  // real time, and clicking a button in HackSight's own popup moves focus
+  // there. By the time we replay, the page's own compose box is very often
+  // no longer the focused element — and a lot of rich-text editors key
+  // their paste/drop handling to whatever IS currently focused, quietly
+  // ignoring anything dispatched elsewhere. Restoring focus to the actual
+  // original target before replaying puts the page back in the same state
+  // a real drop/paste would have found it in.
+  const refocus = (destination: Element): void => {
+    if (!destination.isConnected) return;
+    if (destination instanceof HTMLElement) {
+      try {
+        destination.focus({ preventScroll: true });
+      } catch {
+        // Not every element is focusable — safe to ignore.
+      }
+    }
+  };
+
   if (context.source === "drop" && context.target instanceof EventTarget) {
     const destination = context.target instanceof Element ? context.target : document.body;
-    withReplay(() => destination.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer })));
-    return true;
+    if (destination.isConnected) {
+      refocus(destination);
+      console.log("[HackSight debug] replaying drop →", destination.tagName, destination.className || "(no class)", "activeElement matches:", document.activeElement === destination);
+      withReplay(() => destination.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer })));
+      console.log("[HackSight debug] drop dispatch finished");
+      return true;
+    }
+    console.log("[HackSight debug] drop target was no longer in the page — falling back to input replay");
+    // The original drop target no longer exists (the page re-rendered
+    // while we were scanning/redacting) — a plain input replay is the only
+    // thing left with any chance of working.
   }
   if (context.source === "paste" && context.target instanceof EventTarget) {
     const destination = context.target instanceof Element ? context.target : document.body;
-    withReplay(() => destination.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer })));
-    return true;
+    if (destination.isConnected) {
+      refocus(destination);
+      console.log("[HackSight debug] replaying paste →", destination.tagName, destination.className || "(no class)", "activeElement matches:", document.activeElement === destination);
+      withReplay(() => destination.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer })));
+      console.log("[HackSight debug] paste dispatch finished");
+      return true;
+    }
+    console.log("[HackSight debug] paste target was no longer in the page — falling back to input replay");
   }
 
   // Last resort, for the rare case none of the above applied.
