@@ -21,8 +21,23 @@ function send<T>(message: unknown): Promise<T> {
   return chrome.runtime.sendMessage(message) as Promise<T>;
 }
 
+const SUPPORTED_IMAGE_MIME = /^image\/(png|jpeg|webp)$/i;
+const SUPPORTED_IMAGE_EXTENSION = /\.(png|jpe?g|webp)$/i;
+
 function isSupportedImage(file: File): boolean {
-  return /^(image\/(png|jpeg|webp))$/i.test(file.type) && file.size > 0 && file.size <= MAX_IMAGE_BYTES;
+  if (file.size === 0 || file.size > MAX_IMAGE_BYTES) return false;
+  if (SUPPORTED_IMAGE_MIME.test(file.type)) return true;
+  // Drag-and-drop and clipboard paste reliably tag file.type with a real
+  // MIME type. The native OS "Choose File" dialog often does not — on
+  // systems with no MIME mapping registered for the extension, or with
+  // certain file managers, it comes back empty or as the generic
+  // "unknown file" placeholder even for an ordinary image. Falling back to
+  // the filename extension in exactly those cases means a picked file
+  // still gets scanned instead of silently passing through unreviewed —
+  // this never widens what a real MIME-tagged upload is allowed to be.
+  const type = file.type.toLowerCase();
+  if ((type === "" || type === "application/octet-stream") && SUPPORTED_IMAGE_EXTENSION.test(file.name)) return true;
+  return false;
 }
 
 function findInput(target: EventTarget | null): HTMLInputElement | null {
@@ -42,6 +57,26 @@ function findInput(target: EventTarget | null): HTMLInputElement | null {
 function realTarget(event: Event): EventTarget | null {
   const path = typeof event.composedPath === "function" ? event.composedPath() : [];
   return path[0] ?? event.target;
+}
+
+/**
+ * Rich-text editors (ProseMirror, Lexical, Tiptap, and similar) put
+ * `contenteditable` on one root container and render plain, non-editable
+ * child nodes (a placeholder `<p>`, a text run, etc.) inside it — that's
+ * usually exactly where the cursor sits, and exactly what a real event's
+ * target ends up being. Those editors bind their paste/drop handling, and
+ * their internal selection/focus logic, to that root — not to whichever
+ * descendant happened to be under the cursor. Replaying onto the leaf node
+ * often silently does nothing; walking up to the actual editable root
+ * mirrors what a real paste/drop would have hit.
+ */
+function editableRoot(node: EventTarget | null): Element | null {
+  let el = node instanceof Element ? node : null;
+  while (el) {
+    if (el.hasAttribute("contenteditable") || el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el;
+    el = el.parentElement;
+  }
+  return node instanceof Element ? node : null;
 }
 
 function currentSite(settings: Settings): { site: SiteId; settingKey: string } | null {
@@ -134,33 +169,46 @@ function replayFiles(files: File[], context: UploadContext): boolean {
   };
 
   if (context.source === "drop" && context.target instanceof EventTarget) {
-    const destination = context.target instanceof Element ? context.target : document.body;
+    const destination = editableRoot(context.target) ?? document.body;
     if (destination.isConnected) {
       refocus(destination);
-      console.log("[HackSight debug] replaying drop →", destination.tagName, destination.className || "(no class)", "activeElement matches:", document.activeElement === destination);
       withReplay(() => destination.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: transfer })));
-      console.log("[HackSight debug] drop dispatch finished");
       return true;
     }
-    console.log("[HackSight debug] drop target was no longer in the page — falling back to input replay");
     // The original drop target no longer exists (the page re-rendered
     // while we were scanning/redacting) — a plain input replay is the only
     // thing left with any chance of working.
   }
   if (context.source === "paste" && context.target instanceof EventTarget) {
-    const destination = context.target instanceof Element ? context.target : document.body;
+    const destination = editableRoot(context.target) ?? document.body;
     if (destination.isConnected) {
       refocus(destination);
-      console.log("[HackSight debug] replaying paste →", destination.tagName, destination.className || "(no class)", "activeElement matches:", document.activeElement === destination);
       withReplay(() => destination.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer })));
-      console.log("[HackSight debug] paste dispatch finished");
       return true;
     }
-    console.log("[HackSight debug] paste target was no longer in the page — falling back to input replay");
   }
 
   // Last resort, for the rare case none of the above applied.
   return replayViaInput();
+}
+
+const SCAN_TIMEOUT_MS = 45_000;
+
+/** Whatever the eventual root cause of a hang inside scanning (a stuck
+ * worker, a wedged model load, anything else), the person should never be
+ * stuck without feedback or need to reload the extension to try the next
+ * photo. Race the scan against a hard ceiling so it always settles one way
+ * or the other. */
+function withScanTimeout<T>(work: Promise<T>): Promise<T> {
+  return Promise.race([
+    work,
+    new Promise<T>((_, reject) =>
+      setTimeout(
+        () => reject(new Error("The local scan took too long and was stopped. Try again — this should not need an extension reload.")),
+        SCAN_TIMEOUT_MS
+      )
+    ),
+  ]);
 }
 
 async function reviewFiles(files: File[], context: UploadContext, settings: Settings, site: SiteId): Promise<void> {
@@ -172,7 +220,7 @@ async function reviewFiles(files: File[], context: UploadContext, settings: Sett
       activeScanDialog = dialog;
       let scan;
       try {
-        scan = await scanLocally({ file, site, settings, onProgress: (label) => dialog.update(label) });
+        scan = await withScanTimeout(scanLocally({ file, site, settings, onProgress: (label) => dialog.update(label) }));
       } catch (error) {
         const message = error instanceof Error ? error.message : "Local scan failed.";
         const empty = scoreFindings([], "Unknown");

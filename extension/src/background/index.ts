@@ -1,6 +1,6 @@
 import type { Finding } from "@hacksight/lib/detectSecrets";
 import { DEFAULT_SETTINGS, type ScanSummary, type ScanTier, type Settings } from "../shared/types";
-import { originPattern } from "../shared/sites";
+import { originPattern, siteForHostname, SUPPORTED_MATCHES } from "../shared/sites";
 
 const SETTINGS_KEY = "settings";
 const LAST_SCAN_KEY = "lastScan";
@@ -36,6 +36,50 @@ function activeContentFile(): string {
   return contentFile;
 }
 
+/**
+ * chrome.scripting.registerContentScripts only affects *future* navigations
+ * — a tab that's already sitting open on a matching site never picks up a
+ * newly-registered script on its own, which is exactly what "only works
+ * after I reload the page" looks like from the outside. Inject directly
+ * into whatever matching tabs are already open the moment protection is
+ * turned on for them, so it's active immediately, no reload required.
+ *
+ * `skip` lets a caller exclude tabs already covered by a different
+ * registration (see registerAllSitesContentScript) — Chrome does not
+ * deduplicate overlapping content-script registrations on its own, and
+ * injecting the same module twice into one page creates two independent
+ * copies of all its state and event listeners, which shows up over a
+ * session as stuck scans, duplicated popups, or a UI that stops responding
+ * until the page is reloaded.
+ */
+async function injectIntoOpenTabs(matches: string[], skip?: (hostname: string) => boolean): Promise<void> {
+  if (matches.length === 0) return;
+  let tabs: chrome.tabs.Tab[];
+  try {
+    tabs = await chrome.tabs.query({ url: matches });
+  } catch {
+    return; // best-effort — the next real navigation will still pick up the registration
+  }
+  const file = activeContentFile();
+  await Promise.all(
+    tabs
+      .filter((tab): tab is chrome.tabs.Tab & { id: number; url: string } => typeof tab.id === "number" && typeof tab.url === "string")
+      .filter((tab) => {
+        if (!skip) return true;
+        try {
+          return !skip(new URL(tab.url).hostname.toLowerCase());
+        } catch {
+          return true;
+        }
+      })
+      .map((tab) =>
+        chrome.scripting
+          .executeScript({ target: { tabId: tab.id }, files: [file] })
+          .catch(() => undefined) // e.g. chrome:// tabs, or the tab navigated away mid-query — safe to skip
+      )
+  );
+}
+
 async function registerCustomContentScripts(domains: string[]): Promise<void> {
   await chrome.scripting.unregisterContentScripts({ ids: [CUSTOM_CONTENT_SCRIPT_ID] }).catch(() => undefined);
   if (domains.length === 0) return;
@@ -49,6 +93,7 @@ async function registerCustomContentScripts(domains: string[]): Promise<void> {
       persistAcrossSessions: true,
     },
   ]);
+  await injectIntoOpenTabs(domains.map(originPattern));
 }
 
 /** Registers (or removes) a single content script matching every http(s)
@@ -62,15 +107,26 @@ async function registerAllSitesContentScript(enabled: boolean): Promise<void> {
   const hasPermission = await chrome.permissions.contains({ origins: ALL_SITES_MATCHES });
   if (!hasPermission) return; // permission was revoked outside the options page — stay off rather than throw
 
+  // Sites already covered by the static manifest entry (the 5 built-in
+  // sites) or an individually-added custom domain must be excluded here —
+  // otherwise a page matching both this and one of those gets the content
+  // script injected twice, with two independent copies of all its state.
+  const { customDomains } = await getSettings();
+  const isAlreadyCovered = (hostname: string): boolean =>
+    siteForHostname(hostname) !== null || customDomains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  const excludeMatches = [...SUPPORTED_MATCHES, ...customDomains.map(originPattern)];
+
   await chrome.scripting.registerContentScripts([
     {
       id: ALL_SITES_CONTENT_SCRIPT_ID,
       matches: ALL_SITES_MATCHES,
+      excludeMatches,
       js: [activeContentFile()],
       runAt: "document_start",
       persistAcrossSessions: true,
     },
   ]);
+  await injectIntoOpenTabs(ALL_SITES_MATCHES, isAlreadyCovered);
 }
 
 function storedSummary(summary: ScanSummary): StoredScanSummary {
