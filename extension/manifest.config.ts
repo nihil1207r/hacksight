@@ -27,6 +27,17 @@ export default defineManifest({
       js: ["src/content/index.ts"],
       run_at: "document_start",
     },
+    {
+      // Runs in the page's own JS context (not the extension's isolated
+      // one) so it can see calls the page makes directly to
+      // window.showOpenFilePicker() — an upload path that never fires any
+      // DOM event the isolated content script above could observe. See
+      // filePickerBridge.ts for why this is necessary and what it does.
+      matches: SUPPORTED_MATCHES,
+      js: ["src/content/filePickerBridge.ts"],
+      run_at: "document_start",
+      world: "MAIN",
+    },
   ],
   // These are fetched by workers launched from the isolated content script.
   // They do not grant page access or host permissions; the broad match is

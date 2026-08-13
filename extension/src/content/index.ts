@@ -1,4 +1,3 @@
-import { scoreFindings } from "@hacksight/lib/detectSecrets";
 import { generateSafeImage, scanLocally } from "../shared/pipeline";
 import { makeFailedScanSummary, type ScanSummary, type Settings } from "../shared/types";
 import { siteForHostname, type SiteId } from "../shared/sites";
@@ -111,6 +110,24 @@ function showScanningDialog(file: File): { update: (message: string) => void; cl
   return { update: (message) => (status.textContent = message), close: () => host.remove() };
 }
 
+function showMultiScanningDialog(files: File[]): { updateFile: (file: File, message: string) => void; close: () => void } {
+  const host = document.createElement("div");
+  const shadow = host.attachShadow({ mode: "closed" });
+  const rows = files
+    .map((file, i) => `<div class="row" data-index="${i}"><span class="row-name">${escapeHtml(file.name || "Image")}</span><span class="row-status">Starting…</span></div>`)
+    .join("");
+  shadow.innerHTML = `<style>:host{all:initial}.veil{position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:18px;background:#070a10dc;color:#f4f6fb;font:14px/1.45 system-ui}.card{width:min(100%,530px);max-height:88vh;overflow:auto;border:1px solid #ffffff1c;border-radius:16px;background:#11151f;box-shadow:0 24px 70px #000;padding:24px}.eyebrow{color:#aeb8cb;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.title{margin:5px 0 7px;font-size:24px}.body{color:#aeb8cb;margin:0 0 14px}.rows{display:grid;gap:6px}.row{display:flex;align-items:center;justify-content:space-between;gap:12px;border:1px solid #ffffff18;border-radius:9px;padding:9px 12px;background:#090c12}.row-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-status{color:#8491a8;font-size:12px;flex:none}.footnote{margin:14px 0 0;color:#6f7a90;font-size:12px}</style><div class="veil"><section class="card" role="status" aria-live="polite"><div class="eyebrow">HackSight AI local review</div><h1 class="title">Checking ${files.length} images for sensitive information</h1><p class="body">Scanning all of them locally, at once — this happens on your device.</p><div class="rows">${rows}</div><p class="footnote">Nothing is sent anywhere during this step. You'll get a chance to review anything found before the upload continues.</p></section></div>`;
+  const statusEls = new Map(files.map((file, i) => [file, shadow.querySelector<HTMLElement>(`[data-index="${i}"] .row-status`)!]));
+  (document.documentElement ?? document.body).append(host);
+  return {
+    updateFile: (file, message) => {
+      const el = statusEls.get(file);
+      if (el) el.textContent = message;
+    },
+    close: () => host.remove(),
+  };
+}
+
 function withReplay(action: () => void): void {
   replayingUpload = true;
   try {
@@ -211,45 +228,121 @@ function withScanTimeout<T>(work: Promise<T>): Promise<T> {
   ]);
 }
 
+/** Scans one file and returns the reviewer's decision — reused by both the
+ * normal input/drop/paste flow below (which loops this over possibly
+ * several files) and the file-picker bridge handler further down (which
+ * only ever has one file at a time and doesn't need to replay a DOM event,
+ * since it controls the return value of the intercepted API call directly). */
+interface ScanOutcome {
+  file: File;
+  summary: ScanSummary;
+  warning?: string;
+}
+
+async function scanOneFile(file: File, site: SiteId, settings: Settings, onProgress: (label: string) => void): Promise<ScanOutcome> {
+  try {
+    const scan = await withScanTimeout(scanLocally({ file, site, settings, onProgress }));
+    return { file, summary: scan.summary, warning: scan.warning };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Local scan failed.";
+    // Do not turn an OCR/model/asset error into a green "safe" result.
+    return { file, summary: makeFailedScanSummary(site, file.name, message), warning: message };
+  }
+}
+
+/** Scans one file and returns the reviewer's decision — reused by the
+ * single-image fast path below and the file-picker bridge handler further
+ * down (which only ever has one file at a time and doesn't need to replay a
+ * DOM event, since it controls the return value of the intercepted API call
+ * directly). */
+async function scanAndReviewOneFile(file: File, site: SiteId, settings: Settings): Promise<ReviewDecision> {
+  const dialog = showScanningDialog(file);
+  activeScanDialog = dialog;
+  const outcome = await scanOneFile(file, site, settings, (label) => dialog.update(label)).finally(() => {
+    dialog.close();
+    if (activeScanDialog === dialog) activeScanDialog = null;
+  });
+  void send({ type: "scan:complete", summary: outcome.summary });
+  // A clean, completed scan should not interrupt the user — auto-continue.
+  // The review dialog is reserved for actual findings (or a scan failure,
+  // where safety is unknown).
+  if (outcome.summary.findings.length === 0 && !outcome.summary.error) {
+    return { action: "continue", file };
+  }
+  return openReview(file, outcome.summary, outcome.warning);
+}
+
 async function reviewFiles(files: File[], context: UploadContext, settings: Settings, site: SiteId): Promise<void> {
   reviewInProgress = true;
-  const approved: File[] = [];
   try {
-    for (const file of files) {
-      const dialog = showScanningDialog(file);
-      activeScanDialog = dialog;
-      let scan;
-      try {
-        scan = await withScanTimeout(scanLocally({ file, site, settings, onProgress: (label) => dialog.update(label) }));
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Local scan failed.";
-        const empty = scoreFindings([], "Unknown");
-        // Do not turn an OCR/model/asset error into a green "safe" result.
-        // The empty result remains only to preserve the response shape.
-        scan = { result: empty, summary: makeFailedScanSummary(site, file.name, message), warning: message };
-      } finally {
-        dialog.close();
-        if (activeScanDialog === dialog) activeScanDialog = null;
-      }
-      void send({ type: "scan:complete", summary: scan.summary });
-      // A clean, completed scan should not interrupt the user. Replay the
-      // original image automatically; the review dialog is reserved for
-      // actual findings (or a scan failure, where safety is unknown).
-      if (scan.summary.findings.length === 0 && !scan.summary.error) {
-        approved.push(file);
-        continue;
-      }
-      const decision = await openReview(file, scan.summary, scan.warning);
+    if (files.length === 1) {
+      // Keep the existing, already-polished single-image experience
+      // completely unchanged — the dialogs below exist specifically for
+      // when more than one image arrives at once.
+      const decision = await scanAndReviewOneFile(files[0], site, settings);
       if (decision.action === "cancel") {
         showToast("Upload cancelled. The original image was not replayed.", "warning");
         return;
       }
+      if (replayFiles([decision.file], context)) {
+        showToast(decision.file !== files[0] ? "HackSight replayed a redacted image." : "HackSight continued your upload.", "success");
+      } else {
+        showToast("This site could not replay the selected upload. Download the safe copy and attach it manually.", "warning");
+      }
+      return;
+    }
+
+    // Multiple images at once: scan all of them concurrently — the OCR/NER
+    // work for each is fully independent of the others — instead of
+    // stepping through them one at a time.
+    const dialog = showMultiScanningDialog(files);
+    let outcomes: ScanOutcome[];
+    try {
+      outcomes = await Promise.all(files.map((file) => scanOneFile(file, site, settings, (label) => dialog.updateFile(file, label))));
+    } finally {
+      dialog.close();
+    }
+    outcomes.forEach((outcome) => void send({ type: "scan:complete", summary: outcome.summary }));
+
+    const flagged = outcomes.filter((outcome) => outcome.summary.findings.length > 0 || outcome.summary.error);
+    const decisionByFile = new Map<File, ReviewDecision>();
+
+    if (flagged.length === 1) {
+      const only = flagged[0];
+      decisionByFile.set(only.file, await openReview(only.file, only.summary, only.warning));
+    } else if (flagged.length > 1) {
+      const decisions = await openMultiReview(flagged.map((outcome) => ({ file: outcome.file, summary: outcome.summary, warning: outcome.warning })));
+      decisions.forEach((decision, file) => decisionByFile.set(file, decision));
+    }
+
+    // Rebuild in the original order — clean images pass through untouched,
+    // flagged ones use whatever the reviewer decided for each.
+    const approved: File[] = [];
+    let cancelledCount = 0;
+    let anyRedacted = false;
+    for (const outcome of outcomes) {
+      const decision = decisionByFile.get(outcome.file);
+      if (!decision) {
+        approved.push(outcome.file);
+        continue;
+      }
+      if (decision.action === "cancel") {
+        cancelledCount++;
+        continue;
+      }
+      if (decision.file !== outcome.file) anyRedacted = true;
       approved.push(decision.file);
     }
+
+    if (approved.length === 0) {
+      showToast("Upload cancelled.", "warning");
+      return;
+    }
     if (replayFiles(approved, context)) {
-      showToast(approved.some((file, index) => file !== files[index]) ? "HackSight replayed a redacted image." : "HackSight continued your upload.", "success");
+      const base = anyRedacted ? "HackSight replayed your images, some redacted." : "HackSight continued your upload.";
+      showToast(cancelledCount > 0 ? `${base} ${cancelledCount} image${cancelledCount === 1 ? "" : "s"} not sent.` : base, "success");
     } else {
-      showToast("This site could not replay the selected upload. Download the safe copy and attach it manually.", "warning");
+      showToast("This site could not replay the selected upload. Download the safe copies and attach them manually.", "warning");
     }
   } finally {
     activeScanDialog?.close();
@@ -461,3 +554,133 @@ function openReview(file: File, summary: ScanSummary, warning?: string): Promise
     (document.documentElement ?? document.body).append(host);
   });
 }
+
+interface FlaggedItem {
+  file: File;
+  summary: ScanSummary;
+  warning?: string;
+}
+
+/** The combined review dialog shown when more than one image in a single
+ * upload has findings. Each image gets its own row with its own findings
+ * and its own Cancel/Continue/Redact controls — deciding one doesn't block
+ * or affect the others. Resolves once every row has a decision, or
+ * immediately if "Cancel all remaining" is used. */
+function openMultiReview(items: FlaggedItem[]): Promise<Map<File, ReviewDecision>> {
+  return new Promise((resolve) => {
+    const host = document.createElement("div");
+    const shadow = host.attachShadow({ mode: "closed" });
+    const decisions = new Map<File, ReviewDecision>();
+    const tone: Record<ScanSummary["tier"], string> = { safe: "#33d992", mostly_safe: "#ffb020", think_again: "#ff7a1a", do_not_share: "#ff3b4e" };
+
+    const rows = items
+      .map((item, i) => {
+        const findings = item.summary.findings
+          .map((finding) => `<li><strong>${escapeHtml(finding.label)}</strong><span>${escapeHtml(finding.maskedValue)}</span><em>Severity ${finding.severity}/10</em></li>`)
+          .join("");
+        const canRedact = item.summary.findings.length > 0 && !item.summary.error;
+        return `<div class="row" data-index="${i}"><div class="row-head"><span class="row-name">${escapeHtml(item.file.name || "Image")}</span><span class="row-score" style="border-color:${tone[item.summary.tier]};color:${tone[item.summary.tier]}">${item.summary.score}% Safe</span></div><p class="row-sub">${labelForTier(item.summary.tier)} · ${item.summary.findings.length} finding${item.summary.findings.length === 1 ? "" : "s"}</p>${item.warning ? `<p class="row-warning">${escapeHtml(item.warning)}</p>` : ""}${findings ? `<details><summary>Show findings</summary><ul class="findings">${findings}</ul></details>` : ""}<div class="row-actions"><button class="cancel" data-action="cancel" type="button">Cancel</button><button class="continue" data-action="continue" type="button">Continue anyway</button>${canRedact ? `<button class="redact" data-action="redact" type="button">Use redacted version</button>` : ""}</div></div>`;
+      })
+      .join("");
+
+    shadow.innerHTML = `<style>:host{all:initial}.veil{position:fixed;inset:0;z-index:2147483647;display:grid;place-items:center;padding:18px;background:#070a10dc;color:#f4f6fb;font:14px/1.45 system-ui}.card{width:min(100%,640px);max-height:92vh;overflow:auto;border:1px solid #ffffff1c;border-radius:16px;background:#11151f;box-shadow:0 24px 70px #000;padding:24px}.eyebrow{color:#aeb8cb;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.title{margin:5px 0 4px;font-size:22px}.body{color:#aeb8cb;margin:0 0 16px}.rows{display:grid;gap:12px}.row{border:1px solid #ffffff18;border-radius:11px;padding:12px 14px;background:#090c12;transition:opacity .15s}.row-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.row-name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.row-score{white-space:nowrap;border:1px solid;border-radius:999px;padding:4px 9px;font-weight:800;font-size:12px}.row-sub{margin:4px 0 0;color:#8491a8;font-size:12px}.row-warning{margin:8px 0 0;border:1px solid #ffb02077;background:#ffb02017;color:#ffd893;border-radius:8px;padding:8px 10px;font-size:12px}details{margin-top:8px}summary{cursor:pointer;color:#8491a8;font-size:12px}.findings{margin:8px 0 0;padding:0;list-style:none;display:grid;gap:6px}.findings li{display:grid;gap:2px;border:1px solid #ffffff18;border-radius:8px;padding:8px 10px;background:#11151f}.findings span{font-family:ui-monospace,monospace;color:#bdc7da;font-size:13px}.findings em{font-style:normal;color:#8491a8;font-size:11px}.row-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;margin-top:10px}.row-actions button{border:0;border-radius:7px;padding:8px 11px;font:700 13px system-ui;cursor:pointer;color:#fff;background:#303949}.row-actions .redact{background:#267f59}.row-actions .continue{background:#b94f28}.row-actions .cancel{background:#1b2331}.global-actions{display:flex;justify-content:flex-end;margin-top:16px}.global-actions button{border:0;border-radius:8px;padding:9px 13px;font:700 13px system-ui;cursor:pointer;color:#ffb0b0;background:#2a1620}@media(max-width:480px){.row-head{display:block}.row-score{display:inline-block;margin-top:8px}.row-actions button{flex:1}}</style><div class="veil"><section class="card" role="dialog" aria-modal="true" aria-labelledby="title"><div class="eyebrow">HackSight AI · local review</div><h1 class="title" id="title">${items.length} images need review</h1><p class="body">Decide each one — the rest are not affected by your choice.</p><div class="rows">${rows}</div><div class="global-actions"><button class="cancel-all" type="button">Cancel all remaining</button></div></section></div>`;
+
+    let remaining = items.length;
+    const finishIfDone = (): void => {
+      if (remaining > 0) return;
+      host.remove();
+      resolve(decisions);
+    };
+
+    items.forEach((item, i) => {
+      const row = shadow.querySelector<HTMLElement>(`[data-index="${i}"]`);
+      if (!row) return;
+      const settle = (decision: ReviewDecision): void => {
+        if (decisions.has(item.file)) return; // already decided (e.g. via cancel-all racing a click)
+        decisions.set(item.file, decision);
+        row.style.opacity = "0.45";
+        row.querySelectorAll("button").forEach((button) => ((button as HTMLButtonElement).disabled = true));
+        remaining--;
+        finishIfDone();
+      };
+      row.querySelector<HTMLButtonElement>('[data-action="cancel"]')!.onclick = () => settle({ action: "cancel" });
+      row.querySelector<HTMLButtonElement>('[data-action="continue"]')!.onclick = () => settle({ action: "continue", file: item.file });
+      row.querySelector<HTMLButtonElement>('[data-action="redact"]')?.addEventListener("click", async (event) => {
+        const button = event.currentTarget as HTMLButtonElement;
+        button.disabled = true;
+        button.textContent = "Redacting locally…";
+        try {
+          const safe = await generateSafeImage(item.file, item.summary.findings);
+          const stem = (item.file.name || "image").replace(/\.[^.]+$/, "");
+          settle({ action: "continue", file: new File([safe.blob], `${stem}-hacksight-redacted.png`, { type: "image/png" }) });
+        } catch (error) {
+          button.disabled = false;
+          button.textContent = "Use redacted version";
+          showToast(error instanceof Error ? error.message : "Could not create a safe image.", "warning");
+        }
+      });
+    });
+
+    shadow.querySelector<HTMLButtonElement>(".cancel-all")!.onclick = () => {
+      items.forEach((item) => {
+        if (!decisions.has(item.file)) {
+          decisions.set(item.file, { action: "cancel" });
+          remaining--;
+        }
+      });
+      finishIfDone();
+    };
+
+    (document.documentElement ?? document.body).append(host);
+  });
+}
+
+/**
+ * Handles review requests forwarded from filePickerBridge.ts, which runs in
+ * the page's own JS context (not this isolated one) and intercepts calls
+ * the page makes directly to window.showOpenFilePicker() — an upload path
+ * that never dispatches any DOM event, so none of the listeners above can
+ * see it. That bridge script has no access to chrome.* APIs or the scan
+ * pipeline itself; this is where the actual scanning and review happen,
+ * reusing the exact same logic the input/drop/paste flow above uses.
+ */
+async function handleFilePickerReview(requestId: string, file: File): Promise<void> {
+  const respond = (detail: ReviewDecision): void => {
+    window.dispatchEvent(new CustomEvent(`hacksight:file-picker-result:${requestId}`, { detail }));
+  };
+
+  if (replayingUpload || !isSupportedImage(file)) {
+    respond({ action: "continue", file });
+    return;
+  }
+
+  const settings = settingsCache ?? (await send<Settings>({ type: "settings:get" }));
+  settingsCache = settings;
+  const site = currentSite(settings);
+  const enabled = settings.enabled && site !== null && settings.siteEnabled[site.settingKey] !== false;
+  if (!enabled || !site) {
+    respond({ action: "continue", file });
+    return;
+  }
+  if (reviewInProgress) {
+    showToast("HackSight is already reviewing another upload. This image was not reviewed.", "warning");
+    respond({ action: "continue", file });
+    return;
+  }
+
+  reviewInProgress = true;
+  try {
+    const decision = await scanAndReviewOneFile(file, site.site, settings);
+    if (decision.action === "cancel") showToast("Upload cancelled.", "warning");
+    respond(decision);
+  } finally {
+    activeScanDialog?.close();
+    activeScanDialog = null;
+    reviewInProgress = false;
+  }
+}
+
+window.addEventListener("hacksight:file-picker-review", (event) => {
+  const detail = (event as CustomEvent).detail as { requestId: string; file: File };
+  void handleFilePickerReview(detail.requestId, detail.file);
+});
