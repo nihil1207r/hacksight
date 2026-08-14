@@ -62,13 +62,13 @@ function Eyebrow({ children }: { children: React.ReactNode }) {
 }
 
 export function Landing({
-  onFile,
+  onFiles,
   deepScan,
   onDeepScanChange,
   cloudDeepScan,
   onCloudDeepScanChange,
 }: {
-  onFile: (file: File) => void;
+  onFiles: (files: File[]) => void;
   deepScan: boolean;
   onDeepScanChange: (v: boolean) => void;
   cloudDeepScan: boolean;
@@ -85,7 +85,7 @@ export function Landing({
       if (!res.ok) throw new Error(`Sample image request failed (${res.status}).`);
       const blob = await res.blob();
       const file = new File([blob], SAMPLE_IMAGE_NAME, { type: blob.type || "image/png" });
-      onFile(file);
+      onFiles([file]);
     } catch {
       setSampleError("Couldn't load the sample screenshot — try dropping your own instead.");
       setLoadingSample(false);
@@ -118,7 +118,7 @@ export function Landing({
       </div>
 
       <div className="animate-scale-in" style={{ animationDelay: "0.1s" }}>
-        <Dropzone onFile={onFile} />
+        <Dropzone onFiles={onFiles} />
 
         <div className="mt-3 flex flex-col items-center gap-1.5">
           <button

@@ -14,11 +14,10 @@ function rejectionMessage(rejections: FileRejection[]): string {
   const code = first.errors[0]?.code;
   if (code === "file-too-large") return "That image is over 15MB — try a smaller screenshot.";
   if (code === "file-invalid-type") return "HackSight only reads images (PNG, JPG, WEBP).";
-  if (code === "too-many-files") return "Drop one screenshot at a time.";
   return first.errors[0]?.message ?? "That file couldn't be used.";
 }
 
-export function Dropzone({ onFile }: { onFile: (file: File) => void }) {
+export function Dropzone({ onFiles }: { onFiles: (files: File[]) => void }) {
   const [error, setError] = useState<string | null>(null);
 
   const onDrop = useCallback(
@@ -27,18 +26,17 @@ export function Dropzone({ onFile }: { onFile: (file: File) => void }) {
         setError(rejectionMessage(rejections));
         return;
       }
-      if (accepted[0]) {
+      if (accepted.length > 0) {
         setError(null);
-        onFile(accepted[0]);
+        onFiles(accepted);
       }
     },
-    [onFile]
+    [onFiles]
   );
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { "image/png": [], "image/jpeg": [], "image/webp": [] },
-    maxFiles: 1,
     maxSize: MAX_SIZE_BYTES,
   });
 
@@ -51,28 +49,29 @@ export function Dropzone({ onFile }: { onFile: (file: File) => void }) {
       const items = e.clipboardData?.items;
       if (!items || items.length === 0) return;
 
-      let imageFile: File | null = null;
+      const imageFiles: File[] = [];
       for (const item of items) {
         if (item.kind === "file" && ACCEPTED_TYPES.includes(item.type)) {
-          imageFile = item.getAsFile();
-          break;
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
         }
       }
 
-      if (!imageFile) return;
+      if (imageFiles.length === 0) return;
       e.preventDefault();
 
-      if (imageFile.size > MAX_SIZE_BYTES) {
+      const oversized = imageFiles.find((file) => file.size > MAX_SIZE_BYTES);
+      if (oversized) {
         setError("That image is over 15MB — try a smaller screenshot.");
         return;
       }
       setError(null);
-      onFile(imageFile);
+      onFiles(imageFiles);
     }
 
     window.addEventListener("paste", handlePaste);
     return () => window.removeEventListener("paste", handlePaste);
-  }, [onFile]);
+  }, [onFiles]);
 
   return (
     <div>
@@ -103,10 +102,10 @@ export function Dropzone({ onFile }: { onFile: (file: File) => void }) {
             <ScanEye size={28} color="var(--red)" strokeWidth={1.75} />
           </div>
           <div className="font-display mb-2 text-[19px] font-semibold">
-            {isDragActive ? "Drop it to scan" : "Drop a screenshot to check it"}
+            {isDragActive ? "Drop them to scan" : "Drop screenshots to check them"}
           </div>
           <div className="mb-5 text-[14px]" style={{ color: "var(--muted)" }}>
-            or click to browse &nbsp;·&nbsp; PNG, JPG, WEBP &nbsp;·&nbsp; up to 15MB
+            or click to browse &nbsp;·&nbsp; PNG, JPG, WEBP &nbsp;·&nbsp; up to 15MB each &nbsp;·&nbsp; one or many at once
           </div>
           <div className="mb-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5">
             <div className="font-mono flex items-center gap-1.5 text-[11.5px]" style={{ color: "var(--green)" }}>

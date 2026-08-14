@@ -64,11 +64,13 @@ export function AnalysisScreen({
   deepScan,
   cloudDeepScan,
   onReset,
+  resetLabel = "scan another screenshot",
 }: {
   file: File;
   deepScan: boolean;
   cloudDeepScan: boolean;
   onReset: () => void;
+  resetLabel?: string;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("scanning_screenshot");
@@ -448,7 +450,7 @@ export function AnalysisScreen({
         style={{ color: "var(--muted)", background: "none", border: "none", cursor: "pointer" }}
       >
         <RefreshCcw size={13} />
-        scan another screenshot
+        {resetLabel}
       </button>
 
       {done && result && (

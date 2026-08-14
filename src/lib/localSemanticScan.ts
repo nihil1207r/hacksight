@@ -45,7 +45,14 @@ const ENTITY_MAP: Partial<Record<string, SemanticCategory>> = {
 // compile the ONNX graph) is the expensive part, not running it — keep one
 // pipeline alive for the tab's lifetime so only the first scan pays for it.
 let pipelinePromise: Promise<NerPipeline> | null = null;
-let currentOnProgress: ((p: LocalScanProgress) => void) | undefined;
+// Model loading is a single shared resource — if several images are being
+// scanned concurrently and this is the first load in the session, every one
+// of them is genuinely waiting on the exact same load, so all of their
+// progress callbacks should see it. A single shared variable here (as this
+// used to be) meant the load's progress calls quietly redirected entirely
+// to whichever call started most recently, and any others simply stopped
+// hearing progress until they, coincidentally, became the "current" one.
+const progressListeners = new Set<(p: LocalScanProgress) => void>();
 
 async function getPipeline(): Promise<NerPipeline> {
   if (!pipelinePromise) {
@@ -69,7 +76,8 @@ async function getPipeline(): Promise<NerPipeline> {
 
       const pipe = await pipeline("token-classification", MODEL_ID, {
         progress_callback: (p: { status: string; progress?: number }) => {
-          currentOnProgress?.({ status: p.status, progress: p.progress ? p.progress / 100 : 0 });
+          const mapped: LocalScanProgress = { status: p.status, progress: p.progress ? p.progress / 100 : 0 };
+          progressListeners.forEach((listener) => listener(mapped));
         },
       });
       return pipe as unknown as NerPipeline;
@@ -115,12 +123,12 @@ export async function runLocalSemanticScan(lines: OcrLine[], onProgress?: (p: Lo
   const hasText = lines.some((l) => l.text.trim().length > 0);
   if (!hasText) return [];
 
-  currentOnProgress = onProgress;
+  if (onProgress) progressListeners.add(onProgress);
   let ner: NerPipeline;
   try {
     ner = await getPipeline();
   } catch (err) {
-    currentOnProgress = undefined;
+    if (onProgress) progressListeners.delete(onProgress);
     throw err instanceof Error ? err : new Error("Could not load the on-device model.");
   }
 
@@ -202,7 +210,7 @@ export async function runLocalSemanticScan(lines: OcrLine[], onProgress?: (p: Lo
     }
   }
 
-  currentOnProgress = undefined;
+  if (onProgress) progressListeners.delete(onProgress);
   return findings;
 }
 

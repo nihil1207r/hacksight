@@ -29,12 +29,32 @@ export function configureLocalOcrAssets(assets: LocalOcrAssets | null): void {
 /**
  * Performance: creating a Tesseract worker (loading the wasm core + language
  * data) is the expensive part of OCR, not the recognition pass itself. We
- * keep one worker alive for the lifetime of the tab and reuse it across
- * every "scan another screenshot" — only the very first scan pays the
- * cold-start cost.
+ * keep a small pool of workers alive for the lifetime of the tab and reuse
+ * them across scans — only the very first few scans pay the cold-start
+ * cost. A pool rather than a single worker matters specifically for
+ * concurrent multi-image scanning: Tesseract.js's WASM work is one job per
+ * worker at a time, so a single shared worker would silently serialize
+ * every "concurrent" scan behind it regardless of how the calling code is
+ * written. A handful of workers lets several images genuinely OCR in
+ * parallel, bounded so a large batch doesn't spawn one heavy WASM instance
+ * per image.
  */
-let workerPromise: Promise<Worker> | null = null;
-let currentOnProgress: ((p: OcrProgress) => void) | undefined;
+const MAX_POOL_SIZE = 3;
+
+interface PooledWorker {
+  worker: Worker;
+  busy: boolean;
+  // Tesseract's logger is fixed per worker at creation time, not settable
+  // per recognize() call — routing it through this per-worker field (rather
+  // than the single module-level variable this used to be) is what keeps
+  // one image's progress updates from bleeding into another's scanning
+  // dialog when multiple scans are running at once.
+  onProgress?: (p: OcrProgress) => void;
+}
+
+const pool: PooledWorker[] = [];
+let pendingCreations = 0;
+const waitQueue: Array<() => void> = [];
 
 // Worker creation fetches the Tesseract wasm core + language data from a CDN
 // by default. On a network that blocks that (corporate proxy, offline,
@@ -43,55 +63,98 @@ let currentOnProgress: ((p: OcrProgress) => void) | undefined;
 // that silent hang into a real, visible error.
 const WORKER_INIT_TIMEOUT_MS = 20_000;
 
-function getWorker(): Promise<Worker> {
-  if (!workerPromise) {
-    let gaveUpWaiting = false;
-    const creation = createWorker("eng", 1, {
-      ...(localOcrAssets ?? {}),
-      // A content script cannot directly create a Worker from a
-      // chrome-extension:// URL on every supported host. Tesseract's small
-      // local Blob wrapper imports that packaged worker instead, which keeps
-      // all OCR code local while avoiding the host-origin restriction.
-      ...(localOcrAssets ? { workerBlobURL: true } : {}),
-      logger: (m) => {
-        if (currentOnProgress) currentOnProgress({ status: m.status, progress: m.progress ?? 0 });
-      },
-    });
+async function createPooledWorker(): Promise<PooledWorker> {
+  const entry: PooledWorker = { worker: undefined as unknown as Worker, busy: true };
+  let gaveUpWaiting = false;
 
-    workerPromise = Promise.race([
-      creation,
-      new Promise<Worker>((_, reject) =>
-        setTimeout(() => {
-          gaveUpWaiting = true;
-          reject(
-            new Error(
-              localOcrAssets
-                ? "The packaged OCR engine took too long to load. Check available memory and retry."
-                : "OCR engine took too long to load. This usually means the Tesseract.js CDN (jsdelivr/unpkg) is blocked on this network — check your connection or firewall and try again."
-            )
-          );
-        }, WORKER_INIT_TIMEOUT_MS)
-      ),
-    ]).catch((err) => {
-      // Don't cache a failed attempt — let the next scan retry from scratch.
-      workerPromise = null;
-      throw err;
-    });
+  const creation = createWorker("eng", 1, {
+    ...(localOcrAssets ?? {}),
+    // A content script cannot directly create a Worker from a
+    // chrome-extension:// URL on every supported host. Tesseract's small
+    // local Blob wrapper imports that packaged worker instead, which keeps
+    // all OCR code local while avoiding the host-origin restriction.
+    ...(localOcrAssets ? { workerBlobURL: true } : {}),
+    logger: (m) => {
+      entry.onProgress?.({ status: m.status, progress: m.progress ?? 0 });
+    },
+  });
 
-    // `creation` itself is never cancelled by the race above — if it was
-    // just slow rather than truly hung, it will still resolve on its own
-    // some time after we already gave up on it and reset workerPromise.
-    // Left alone, that worker keeps running with nothing referencing it —
-    // a genuine leaked background thread. Shut it down instead of letting
-    // it linger.
-    void creation.then(
-      (w) => {
-        if (gaveUpWaiting) void w.terminate().catch(() => undefined);
-      },
-      () => undefined // creation's own rejection is already surfaced via the race above
-    );
+  entry.worker = await Promise.race([
+    creation,
+    new Promise<Worker>((_, reject) =>
+      setTimeout(() => {
+        gaveUpWaiting = true;
+        reject(
+          new Error(
+            localOcrAssets
+              ? "The packaged OCR engine took too long to load. Check available memory and retry."
+              : "OCR engine took too long to load. This usually means the Tesseract.js CDN (jsdelivr/unpkg) is blocked on this network — check your connection or firewall and try again."
+          )
+        );
+      }, WORKER_INIT_TIMEOUT_MS)
+    ),
+  ]);
+
+  // `creation` itself is never cancelled by the race above — if it was
+  // just slow rather than truly hung, it will still resolve on its own
+  // some time after we already gave up on it. Left alone, that worker
+  // keeps running with nothing referencing it — a genuine leaked
+  // background thread. Shut it down instead of letting it linger.
+  void creation.then(
+    (w) => {
+      if (gaveUpWaiting) void w.terminate().catch(() => undefined);
+    },
+    () => undefined // creation's own rejection is already surfaced via the race above
+  );
+
+  return entry;
+}
+
+function notifyOneWaiter(): void {
+  waitQueue.shift()?.();
+}
+
+async function acquireWorker(onProgress?: (p: OcrProgress) => void): Promise<PooledWorker> {
+  for (;;) {
+    const free = pool.find((entry) => !entry.busy);
+    if (free) {
+      free.busy = true;
+      free.onProgress = onProgress;
+      return free;
+    }
+    if (pool.length + pendingCreations < MAX_POOL_SIZE) {
+      pendingCreations++;
+      try {
+        const entry = await createPooledWorker();
+        entry.onProgress = onProgress;
+        pool.push(entry);
+        return entry;
+      } finally {
+        pendingCreations--;
+      }
+    }
+    // Pool is full and every worker is busy — wait for a release, then
+    // loop back and retry (rather than being handed a worker directly),
+    // so a discarded/broken worker and a freshly available slot are
+    // handled by the exact same path instead of two separate ones.
+    await new Promise<void>((resolve) => waitQueue.push(resolve));
   }
-  return workerPromise;
+}
+
+/** `discard: true` when the worker may be in a bad state after a failed
+ * recognize() call — don't let a future scan silently reuse one that might
+ * hang or error again; the pool just creates a fresh one next time it's
+ * needed instead. */
+function releaseWorker(entry: PooledWorker, discard = false): void {
+  entry.onProgress = undefined;
+  if (discard) {
+    const index = pool.indexOf(entry);
+    if (index !== -1) pool.splice(index, 1);
+    void entry.worker.terminate().catch(() => undefined);
+  } else {
+    entry.busy = false;
+  }
+  notifyOneWaiter();
 }
 
 /**
@@ -193,8 +256,7 @@ export async function runLocalOcr(
   if (workingBitmap !== bitmap) workingBitmap.close();
   bitmap.close();
 
-  const worker = await getWorker();
-  currentOnProgress = onProgress;
+  const entry = await acquireWorker(onProgress);
 
   // All bbox coordinates come back in the upscaled *working* canvas's
   // coordinate space. Undo both scale steps — the OCR upscale, then the
@@ -209,7 +271,7 @@ export async function runLocalOcr(
   });
 
   try {
-    const { data } = await worker.recognize(preprocessed, {}, { blocks: true });
+    const { data } = await entry.worker.recognize(preprocessed, {}, { blocks: true });
 
     const lines: OcrLine[] = (data.blocks ?? []).flatMap((block) =>
       block.paragraphs.flatMap((paragraph) =>
@@ -230,24 +292,21 @@ export async function runLocalOcr(
       )
     );
 
+    releaseWorker(entry);
     return { lines, imageWidth: width, imageHeight: height };
   } catch (err) {
     // A worker that just failed a recognition pass is not necessarily safe
     // to reuse — don't let a future scan silently retry against one that
     // may already be in a bad state. Worth the cost of recreating it once.
-    workerPromise = null;
+    releaseWorker(entry, true);
     throw err;
-  } finally {
-    currentOnProgress = undefined;
   }
 }
 
-/** Optional cleanup — not required (the browser reclaims the worker when the
- * tab closes), but exposed for callers that want to free memory explicitly. */
+/** Optional cleanup — not required (the browser reclaims workers when the
+ * tab closes), but exposed for callers that want to free memory explicitly.
+ * Terminates every worker currently in the pool. */
 export async function disposeOcrWorker(): Promise<void> {
-  if (workerPromise) {
-    const w = await workerPromise;
-    await w.terminate();
-    workerPromise = null;
-  }
+  const entries = pool.splice(0, pool.length);
+  await Promise.all(entries.map((entry) => entry.worker.terminate().catch(() => undefined)));
 }
